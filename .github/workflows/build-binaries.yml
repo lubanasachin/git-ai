@@ -38,16 +38,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install Zig
-        uses: goto-bus-stop/setup-zig@v2
+      - name: Install cross
+        uses: taiki-e/install-action@cross
 
       - name: Build release binary
-        env:
-          CC: zig cc
-          CXX: zig c++
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: zig cc
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cross build --release --target ${{ matrix.target }}
 
       - name: Create artifact directory
         run: mkdir -p artifacts
