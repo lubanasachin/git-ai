@@ -48,7 +48,7 @@ const AGENT_USAGE_MIN_INTERVAL_SECS: u64 = 150;
 const KNOWN_HUMAN_MIN_SECS_AFTER_AI: u64 = 1;
 
 #[cfg(not(any(test, feature = "test-support")))]
-pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(agent_id: &AgentId) -> bool {
     let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -68,8 +68,19 @@ pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
+fn should_emit_real_agent_usage(_agent_id: &AgentId) -> bool {
     false
+}
+
+fn should_emit_agent_usage_with_throttle(
+    agent_id: &AgentId,
+    should_emit_real_agent_usage: impl FnOnce(&AgentId) -> bool,
+) -> bool {
+    agent_id.tool != "mock_ai" && should_emit_real_agent_usage(agent_id)
+}
+
+pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+    should_emit_agent_usage_with_throttle(agent_id, should_emit_real_agent_usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1112,4 +1123,25 @@ fn compute_line_stats(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_ai_skips_agent_usage_throttle() {
+        let mut agent_id = AgentId {
+            tool: "mock_ai".to_string(),
+            id: "debug-self-check".to_string(),
+            model: "unknown".to_string(),
+        };
+
+        assert!(!should_emit_agent_usage_with_throttle(&agent_id, |_| {
+            panic!("mock checkpoints must not evaluate the real throttle")
+        }));
+
+        agent_id.tool = "claude".to_string();
+        assert!(should_emit_agent_usage_with_throttle(&agent_id, |_| true));
+    }
 }

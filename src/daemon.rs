@@ -2010,7 +2010,7 @@ fn apply_cherry_pick_no_commit_rewrite(
         .iter()
         .map(|source| (source.clone(), new_head.to_string()))
         .collect::<Vec<_>>();
-    crate::git::sync_authorship::fetch_missing_notes_for_commits(repo, sources)?;
+    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, sources);
     let shifted_notes =
         crate::authorship::rewrite::shift_authorship_notes_merging_existing_with_notes(
             repo, &mappings,
@@ -5650,7 +5650,12 @@ impl ActorDaemonCoordinator {
                                     crate::authorship::rewrite_reset::reconstruct_working_log_after_backward_reset(
                                         &repo, old_head, new_head,
                                     )?;
-                                } else if !is_ancestor_commit(&repo, old_head, new_head) {
+                                } else if is_ancestor_commit(&repo, old_head, new_head) {
+                                    // Forward reset (e.g. syncing onto a newer upstream
+                                    // commit): carry the working log to the new base,
+                                    // matching the pull fast-forward side effect.
+                                    repo.storage.rename_working_log(old_head, new_head)?;
+                                } else {
                                     let outcome =
                                         crate::authorship::rewrite::handle_rewrite_event_with_metrics(
                                         &repo,
@@ -8675,6 +8680,7 @@ mod tests {
         std::fs::create_dir_all(head_log.parent().unwrap()).unwrap();
         std::fs::create_dir_all(stash_log.parent().unwrap()).unwrap();
         std::fs::create_dir_all(branch_log.parent().unwrap()).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let old_head_reflog = b"old HEAD reflog entry\n";
         let old_reflog = b"old stash reflog entry\n";
         let old_branch_reflog = b"old branch reflog entry\n";
