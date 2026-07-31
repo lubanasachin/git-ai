@@ -343,55 +343,20 @@ fn get_committed_files_content(
 }
 
 /// Get git diff statistics for a commit range (start..end)
+/// Uses the same diff engine as the single-commit stats path so that
+/// renamed-and-rewritten files are represented as renames with edit hunks
+/// instead of a full delete/add pair (see `get_git_diff_stats` in `stats.rs`).
 fn get_git_diff_stats_for_range(
     repo: &Repository,
     start_sha: &str,
     end_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<(u32, u32), GitAiError> {
-    // Use git diff --numstat to get diff statistics for the range
-    let mut args = repo.global_args_for_exec();
-    args.push("diff".to_string());
-    args.push("--numstat".to_string());
-    args.push(format!("{}..{}", start_sha, end_sha));
+    use crate::authorship::stats::diff_line_counts_from_hunks;
+    use crate::commands::diff::get_diff_with_line_numbers;
 
-    let output = exec_git_with_profile(&args, InternalGitProfile::NumstatParse)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let mut added_lines = 0u32;
-    let mut deleted_lines = 0u32;
-    let ignore_matcher = build_ignore_matcher(ignore_patterns);
-
-    // Parse numstat output
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        // Parse numstat format: "added\tdeleted\tfilename"
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            // Check if this file should be ignored and skip it
-            let filename = parts[2];
-            if should_ignore_file_with_matcher(filename, &ignore_matcher) {
-                continue;
-            }
-
-            // Parse added lines
-            if let Ok(added) = parts[0].parse::<u32>() {
-                added_lines += added;
-            }
-
-            // Parse deleted lines (handle "-" for binary files)
-            if parts[1] != "-"
-                && let Ok(deleted) = parts[1].parse::<u32>()
-            {
-                deleted_lines += deleted;
-            }
-        }
-    }
-
-    Ok((added_lines, deleted_lines))
+    let hunks = get_diff_with_line_numbers(repo, start_sha, end_sha)?;
+    Ok(diff_line_counts_from_hunks(&hunks, ignore_patterns))
 }
 
 /// Calculate AI vs human line contributions for a commit range

@@ -587,6 +587,26 @@ pub(crate) fn stats_for_commit_stats_from_hunks_with_merge_flag(
     )
 }
 
+/// Sum added/deleted line counts across diff hunks, skipping ignored files.
+pub(crate) fn diff_line_counts_from_hunks(
+    hunks: &[crate::commands::diff::DiffHunk],
+    ignore_patterns: &[String],
+) -> (u32, u32) {
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
+    let mut added_lines = 0u32;
+    let mut deleted_lines = 0u32;
+
+    for hunk in hunks {
+        if should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher) {
+            continue;
+        }
+        added_lines += hunk.added_lines.len() as u32;
+        deleted_lines += hunk.deleted_lines.len() as u32;
+    }
+
+    (added_lines, deleted_lines)
+}
+
 /// Get git diff statistics between commit and its parent
 /// Uses the same diff engine as git ai diff to properly handle renames
 pub fn get_git_diff_stats(
@@ -614,19 +634,7 @@ pub fn get_git_diff_stats(
     // Use the diff engine which properly handles renames with --find-renames=1%
     let hunks = get_diff_with_line_numbers(repo, &from_ref, commit_sha)?;
 
-    let ignore_matcher = build_ignore_matcher(ignore_patterns);
-    let mut added_lines = 0u32;
-    let mut deleted_lines = 0u32;
-
-    for hunk in hunks {
-        if should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher) {
-            continue;
-        }
-        added_lines += hunk.added_lines.len() as u32;
-        deleted_lines += hunk.deleted_lines.len() as u32;
-    }
-
-    Ok((added_lines, deleted_lines))
+    Ok(diff_line_counts_from_hunks(&hunks, ignore_patterns))
 }
 
 #[cfg(test)]
