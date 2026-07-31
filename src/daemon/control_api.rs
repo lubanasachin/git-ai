@@ -1,6 +1,5 @@
 use crate::authorship::working_log::AgentId;
 use crate::commands::checkpoint_agent::bash_tool::StatSnapshot;
-use crate::commands::checkpoint_agent::orchestrator::CheckpointRequest;
 use crate::metrics::MetricEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,7 +11,7 @@ pub enum ControlRequest {
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "checkpoint.run")]
-    CheckpointRun { request: Box<CheckpointRequest> },
+    CheckpointRun { body_bytes: u64 },
     #[serde(rename = "sync.family")]
     SyncFamily { repo_working_dir: String },
     #[serde(rename = "status.family")]
@@ -84,6 +83,9 @@ pub enum ControlRequest {
         ended_at_ns: u128,
         command: Option<String>,
     },
+    /// Wait for the daemon to finish all in-flight work and flush telemetry.
+    #[serde(rename = "await")]
+    Await { timeout_secs: u64 },
     #[serde(rename = "shutdown")]
     Shutdown,
 }

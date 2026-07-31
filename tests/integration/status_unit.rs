@@ -1,4 +1,4 @@
-use crate::repos::test_repo::TestRepo;
+use crate::repos::test_repo::{DaemonTestScope, TestRepo};
 use git_ai::authorship::stats::CommitStats;
 use serde::Deserialize;
 use std::fs;
@@ -45,6 +45,22 @@ fn write_file(repo: &TestRepo, path: &str, contents: &str) {
         fs::create_dir_all(parent).expect("parent directory should be creatable");
     }
     fs::write(abs_path, contents).expect("file write should succeed");
+}
+
+#[test]
+fn test_status_remains_available_when_daemon_is_not_running() {
+    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
+    write_file(&repo, "offline-status.txt", "committed\n");
+    repo.git_og(&["add", "offline-status.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "initial"]).unwrap();
+
+    write_file(&repo, "offline-status.txt", "committed\nlocal edit\n");
+    let status = status_json(&repo);
+
+    assert!(
+        status.checkpoints.is_empty(),
+        "offline status should preserve the empty-checkpoint result"
+    );
 }
 
 /// Migrated from src/commands/status.rs test_get_working_dir_diff_stats_post_filter_equivalence
@@ -258,6 +274,45 @@ fn test_ai_accepted_respects_ignore_patterns() {
     );
 }
 
+#[test]
+fn test_status_preserves_lowercase_agent_identifier() {
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("status-agent.txt");
+    fs::write(&file_path, "base\n").unwrap();
+    repo.stage_all_and_commit("initial").unwrap();
+
+    let repo_dir = repo.path().to_string_lossy().to_string();
+    let pre_payload = serde_json::json!({
+        "type": "human",
+        "repo_working_dir": repo_dir,
+        "will_edit_filepaths": ["status-agent.txt"]
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &pre_payload])
+        .unwrap();
+
+    fs::write(&file_path, "base\nAI line\n").unwrap();
+    let post_payload = serde_json::json!({
+        "type": "ai_agent",
+        "repo_working_dir": repo_dir,
+        "edited_filepaths": ["status-agent.txt"],
+        "agent_name": "cline",
+        "model": "test-model",
+        "conversation_id": "cline-status-test"
+    })
+    .to_string();
+    repo.git_ai(&["checkpoint", "agent-v1", "--hook-input", &post_payload])
+        .unwrap();
+
+    let status = status_json(&repo);
+    assert!(
+        status
+            .checkpoints
+            .iter()
+            .any(|checkpoint| { checkpoint["tool_model"].as_str() == Some("cline test-model") })
+    );
+}
+
 /// `--diff-only` must keep the same diff-scoped `stats` as a plain `--json`
 /// run, while omitting the per-checkpoint breakdown.
 #[test]
@@ -324,6 +379,7 @@ crate::reuse_tests_in_worktree!(
     test_working_dir_diff_stats_with_rename,
     test_working_dir_diff_stats_respects_ignore_patterns,
     test_ai_accepted_respects_ignore_patterns,
+    test_status_preserves_lowercase_agent_identifier,
     test_diff_only_omits_checkpoints_but_keeps_stats,
     test_diff_only_no_changes_omits_checkpoints,
 );

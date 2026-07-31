@@ -4,7 +4,6 @@ use crate::authorship::range_authorship;
 use crate::authorship::stats::stats_command;
 use crate::commands;
 use crate::config;
-use crate::daemon::ControlRequest;
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
 use crate::git::repository::{CommitRange, Repository};
@@ -191,6 +190,9 @@ pub fn handle_git_ai(args: &[String]) {
         "flush-metrics-db" => {
             commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
         }
+        "await" => {
+            commands::r#await::handle_await(&args[1..]);
+        }
         "login" => {
             commands::login::handle_login(&args[1..]);
         }
@@ -317,7 +319,7 @@ fn print_help() {
     eprintln!("Commands:");
     eprintln!("  checkpoint         Checkpoint working changes and attribute author");
     eprintln!(
-        "    Presets: claude, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
+        "    Presets: claude, cline, codex, continue-cli, cursor, gemini, github-copilot, amp, windsurf, opencode, pi, ai_tab, firebender, human, mock_ai, mock_known_human, known_human"
     );
     eprintln!(
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
@@ -371,6 +373,8 @@ fn print_help() {
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
     eprintln!("  git-path           Print the path to the underlying git executable");
+    eprintln!("  await [beta]       Wait for the background service to finish all work");
+    eprintln!("    --timeout <seconds>    Maximum time to wait (default: 30)");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
     eprintln!("  fetch-notes [remote] Synchronously fetch AI authorship notes");
@@ -550,22 +554,38 @@ fn handle_checkpoint(args: &[String]) {
     let mut sent_count = 0u64;
     for request in requests {
         let t_send = std::time::Instant::now();
-        let control_request = ControlRequest::CheckpointRun {
-            request: Box::new(request),
-        };
         let send_result =
-            crate::daemon::send_control_request(&config.control_socket_path, &control_request);
+            crate::daemon::send_checkpoint_request(&config.control_socket_path, &request);
         if perf {
             eprintln!(
                 "[perf] checkpoint: ipc_send={:.1}ms",
                 t_send.elapsed().as_secs_f64() * 1000.0,
             );
         }
-        if let Err(e) = send_result {
-            eprintln!("Failed to send checkpoint to background worker: {}", e);
-            std::process::exit(0);
+        match send_result {
+            Ok(response) if response.ok => {
+                if response.seq.is_none() {
+                    eprintln!(
+                        "Failed to send checkpoint to background worker: daemon receipt acknowledgement omitted sequence"
+                    );
+                    std::process::exit(0);
+                }
+                sent_count += 1;
+            }
+            Ok(response) => {
+                eprintln!(
+                    "Failed to send checkpoint to background worker: {}",
+                    response
+                        .error
+                        .unwrap_or_else(|| "daemon rejected checkpoint".to_string())
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("Failed to send checkpoint to background worker: {error}");
+                std::process::exit(0);
+            }
         }
-        sent_count += 1;
     }
 
     if std::env::var_os("GIT_AI_TEST_DB_PATH").is_some() {
