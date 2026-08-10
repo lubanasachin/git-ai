@@ -925,6 +925,80 @@ fn test_stats_ignores_renamed_files() {
     assert_eq!(stats.human_additions, 0);
 }
 
+#[test]
+fn test_stats_range_ignores_renamed_files() {
+    // Range-level counterpart to test_stats_ignores_renamed_files: the range path
+    // (git ai stats start..end) must agree with the single-commit path on pure renames.
+    let repo = TestRepo::new();
+
+    // Initial commit with files in a directory
+    repo.filename("misc/Development Notes.md")
+        .set_contents(crate::lines![
+            "# Development Notes",
+            "",
+            "Some content here",
+            "More content",
+            "Even more",
+            "Line 6",
+            "Line 7",
+            "Line 8",
+            "Line 9",
+            "Line 10",
+            "Line 11",
+            "Line 12",
+            "Line 13",
+            "Line 14",
+            "Line 15",
+            "Line 16"
+        ]);
+    repo.filename("misc/Usage Guide.md")
+        .set_contents(crate::lines!["# Usage Guide", "", "Usage info"]);
+    let first = repo
+        .stage_all_and_commit("Initial commit with misc directory")
+        .unwrap();
+
+    // Rename the directory (pure rename, no content changes)
+    let misc_dev = repo.path().join("misc/Development Notes.md");
+    let misc_usage = repo.path().join("misc/Usage Guide.md");
+    let new_dir = repo.path().join("Misc Docs");
+    fs::create_dir(&new_dir).unwrap();
+    fs::rename(&misc_dev, new_dir.join("Development Notes.md")).unwrap();
+    fs::rename(&misc_usage, new_dir.join("Usage Guide.md")).unwrap();
+    fs::remove_dir(repo.path().join("misc")).unwrap();
+
+    let second = repo
+        .stage_all_and_commit("Rename misc to Misc Docs")
+        .unwrap();
+
+    // Verify that git ai diff recognizes this as a rename over the same range
+    let range = format!("{}..{}", first.commit_sha, second.commit_sha);
+    let diff_output = repo.git_ai(&["diff", &range]).unwrap();
+    assert!(
+        diff_output.contains("similarity index 100%") || diff_output.contains("rename from"),
+        "git ai diff should recognize pure renames over a range"
+    );
+
+    // Range stats should show 0 additions and 0 deletions for pure renames, matching
+    // the single-commit path's behavior for the same rename.
+    let raw = repo
+        .git_ai(&["stats", &range, "--json"])
+        .expect("git-ai stats range should succeed");
+    let json = extract_json_object(&raw);
+    let stats: git_ai::authorship::range_authorship::RangeAuthorshipStats =
+        serde_json::from_str(&json).unwrap();
+
+    assert_eq!(
+        stats.range_stats.git_diff_added_lines, 0,
+        "Pure renames should not count as additions over a range"
+    );
+    assert_eq!(
+        stats.range_stats.git_diff_deleted_lines, 0,
+        "Pure renames should not count as deletions over a range"
+    );
+    assert_eq!(stats.range_stats.ai_additions, 0);
+    assert_eq!(stats.range_stats.human_additions, 0);
+}
+
 crate::reuse_tests_in_worktree!(
     test_authorship_log_stats,
     test_stats_cli_range,
@@ -945,4 +1019,5 @@ crate::reuse_tests_in_worktree!(
     test_stats_range_uses_default_ignores,
     test_post_commit_large_ignored_files_do_not_trigger_skip_warning,
     test_stats_ignores_renamed_files,
+    test_stats_range_ignores_renamed_files,
 );
