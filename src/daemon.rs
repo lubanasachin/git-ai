@@ -63,6 +63,7 @@ pub mod domain;
 pub mod family_actor;
 pub mod git_backend;
 pub mod global_actor;
+mod memory_watchdog;
 pub mod reducer;
 pub mod ref_cursor;
 pub mod rewrite_metrics;
@@ -90,6 +91,7 @@ const TRACE_CONNECTION_CLOSED_EVENT: &str = "git_ai_connection_closed";
 const DAEMON_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const DAEMON_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_CONTROL_RECEIVE_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_CHECKPOINT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const DAEMON_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const CHECKPOINT_INGRESS_REQUEST_LIMIT: usize = 1_024;
@@ -1048,6 +1050,12 @@ fn apply_checkpoint_side_effect(mut request: CheckpointRequest) -> Result<(), Gi
 
     if request.files.is_empty() {
         return Ok(());
+    }
+
+    if request.checkpoint_kind.is_ai()
+        && let Some(agent_id) = request.agent_id.as_mut()
+    {
+        crate::streams::model_extraction::enrich_copilot_agent_model(agent_id, &request.metadata);
     }
 
     let repo_work_dir = &request.files[0].repo_work_dir;
@@ -2688,6 +2696,12 @@ struct PendingCherryPickNoCommit {
 }
 
 #[derive(Debug, Clone)]
+struct PendingRebase {
+    original_head: String,
+    onto: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum RecentReplayPrerequisite {
     CheckoutSwitchRename {
@@ -2729,7 +2743,7 @@ pub struct ActorDaemonCoordinator {
             crate::daemon::git_backend::SystemGitBackend,
         >,
     >,
-    pending_rebase_original_head_by_worktree: Mutex<HashMap<String, (String, Option<String>)>>,
+    pending_rebase_original_head_by_worktree: Mutex<HashMap<String, PendingRebase>>,
     pending_cherry_pick_sources_by_worktree: Mutex<HashMap<String, Vec<String>>>,
     pending_cherry_pick_no_commit_by_worktree: Mutex<HashMap<String, PendingCherryPickNoCommit>>,
     pending_squash_merge_by_worktree: Mutex<HashMap<String, PendingSquashMerge>>,
@@ -3795,6 +3809,25 @@ impl ActorDaemonCoordinator {
         })
     }
 
+    /// As [`Self::has_open_trace_roots_that_may_mutate_refs`], but scoped to
+    /// one family: roots already attributed to a DIFFERENT family (via their
+    /// `def_repo` worktree) cannot mutate this family's refs and are ignored.
+    /// Roots with no family attribution yet fail closed and block everyone.
+    fn has_open_trace_roots_that_may_mutate_family(&self, family: &str) -> bool {
+        let Ok(ingress) = self.trace_ingress_state.lock() else {
+            return false;
+        };
+        ingress.root_open_connections.iter().any(|(root, count)| {
+            *count > 0
+                && !ingress.root_definitely_read_only.contains(root)
+                && ingress.root_mutating.get(root).copied().unwrap_or(true)
+                && ingress
+                    .root_families
+                    .get(root)
+                    .is_none_or(|root_family| root_family == family)
+        })
+    }
+
     fn next_trace_ingest_seq(&self) -> u64 {
         // Relaxed: we only need fetch_add atomicity (unique monotone values),
         // not ordering w.r.t. any other atomic.
@@ -4357,6 +4390,32 @@ impl ActorDaemonCoordinator {
             }
             tokio::select! {
                 _ = progress => {}
+                _ = self.wait_for_shutdown() => return,
+            }
+        }
+    }
+
+    /// As [`Self::wait_for_trace_ingest_processed_through`], but scoped to one
+    /// family: open mutating roots already attributed to a different family do
+    /// not hold this fence, so a long-running git command in one repository no
+    /// longer delays `sync.family` for every other repository. Unattributed
+    /// roots still fail closed and block until their `def_repo` arrives.
+    async fn wait_for_trace_ingest_processed_through_family(&self, family: &str) {
+        loop {
+            let target = self.next_trace_ingest_seq.load(Ordering::Acquire) as u64;
+            self.wait_for_trace_ingest_seq(target).await;
+
+            // Enroll before checking (see wait_for_trace_ingest_seq): the
+            // notify_waiters fired by the root's close/def_repo must not race
+            // the condition load.
+            let progress = self.trace_ingest_progress_notify.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            if !self.has_open_trace_roots_that_may_mutate_family(family) {
+                return;
+            }
+            tokio::select! {
+                _ = &mut progress => {}
                 _ = self.wait_for_shutdown() => return,
             }
         }
@@ -5003,7 +5062,13 @@ impl ActorDaemonCoordinator {
             .map_err(|_| {
                 GitAiError::Generic("pending rebase original-head map lock poisoned".to_string())
             })?;
-        map.insert(Self::worktree_state_key(worktree), (original_head, onto));
+        map.insert(
+            Self::worktree_state_key(worktree),
+            PendingRebase {
+                original_head,
+                onto,
+            },
+        );
         Ok(())
     }
 
@@ -5024,7 +5089,7 @@ impl ActorDaemonCoordinator {
     fn take_pending_rebase_original_head_for_worktree(
         &self,
         worktree: &Path,
-    ) -> Result<Option<(String, Option<String>)>, GitAiError> {
+    ) -> Result<Option<PendingRebase>, GitAiError> {
         let mut map = self
             .pending_rebase_original_head_by_worktree
             .lock()
@@ -5327,6 +5392,53 @@ impl ActorDaemonCoordinator {
                 .or_insert((&rc.old, &rc.new));
         }
 
+        // Lite mode keeps working logs aligned with the final ref tips, but does not
+        // inspect the commit graph or migrate authorship notes. Everything needed for
+        // this bookkeeping comes from the already-normalized trace2/ref transition.
+        if config::Config::get().get_feature_flags().lite_mode {
+            if let Some(pending) = pending_original_head.as_ref()
+                && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
+            {
+                if pending.original_head != new_tip {
+                    repo.storage
+                        .rename_working_log(&pending.original_head, &new_tip)?;
+                }
+                return Ok(());
+            }
+            if !matches!(
+                cmd.primary_command.as_deref(),
+                Some("rebase" | "pull" | "update-ref")
+            ) {
+                return Ok(());
+            }
+            let command_moves_checked_out_history =
+                matches!(cmd.primary_command.as_deref(), Some("rebase" | "pull"));
+            let mut collapsed_head: Option<(&str, &str)> = None;
+            for change in cmd.ref_changes.iter().filter(|change| {
+                change.reference == "HEAD"
+                    && is_valid_oid(&change.old)
+                    && !is_zero_oid(&change.old)
+                    && is_valid_oid(&change.new)
+                    && !is_zero_oid(&change.new)
+            }) {
+                if let Some((_old, new)) = &mut collapsed_head {
+                    *new = &change.new;
+                } else {
+                    collapsed_head = Some((&change.old, &change.new));
+                }
+            }
+            for (old_tip, new_tip) in collapsed.values() {
+                let moves_head = command_moves_checked_out_history
+                    || collapsed_head.is_some_and(|(head_old, head_new)| {
+                        head_old == *old_tip && head_new == *new_tip
+                    });
+                if old_tip != new_tip && moves_head {
+                    repo.storage.rename_working_log(old_tip, new_tip)?;
+                }
+            }
+            return Ok(());
+        }
+
         // Extract "onto" hint from HEAD ref changes for rebases.
         // During a rebase, the first HEAD change target is the onto commit.
         let onto_hint: Option<String> = cmd
@@ -5351,22 +5463,25 @@ impl ActorDaemonCoordinator {
                     branch_changes.len(),
                     pending_original_head
                         .as_ref()
-                        .map(|(head, _)| head.as_str())
+                        .map(|pending| pending.original_head.as_str())
                         .unwrap_or("NONE"),
                     cmd.ref_changes.len(),
                 )
             },
         );
 
-        if let Some((original_head, stored_onto)) = pending_original_head
-            && let Some(new_tip) = rebase_new_tip_from_command(cmd, &original_head)
+        if let Some(pending) = pending_original_head
+            && let Some(new_tip) = rebase_new_tip_from_command(cmd, &pending.original_head)
         {
-            if original_head != new_tip && !is_ancestor_commit(&repo, &original_head, &new_tip) {
+            if pending.original_head != new_tip
+                && !is_ancestor_commit(&repo, &pending.original_head, &new_tip)
+            {
                 let command_rebase_onto =
-                    rebase_onto_from_command(cmd, &repo, &original_head, &new_tip);
-                let rebase_onto = stored_onto
+                    rebase_onto_from_command(cmd, &repo, &pending.original_head, &new_tip);
+                let rebase_onto = pending
+                    .onto
                     .filter(|onto| {
-                        onto != &original_head
+                        onto != &pending.original_head
                             && onto != &new_tip
                             && is_ancestor_commit(&repo, onto, &new_tip)
                     })
@@ -5374,12 +5489,13 @@ impl ActorDaemonCoordinator {
                 let outcome =
                     crate::authorship::rewrite::handle_non_fast_forward_rewrite_with_operation(
                         &repo,
-                        &original_head,
+                        &pending.original_head,
                         &new_tip,
                         rebase_onto.as_deref(),
                         crate::authorship::rewrite::RewriteMetricOperation::Rebase,
                     )?;
-                repo.storage.rename_working_log(&original_head, &new_tip)?;
+                repo.storage
+                    .rename_working_log(&pending.original_head, &new_tip)?;
                 let conflict_base = rebase_onto.clone();
                 let metric_context = process_conflict_resolution_working_logs(
                     &repo,
@@ -5389,8 +5505,12 @@ impl ActorDaemonCoordinator {
                 let metric_commits =
                     rewrite_metric_commits_with_context(outcome.metric_commits, metric_context);
                 if !metric_commits.is_empty() {
-                    let branch =
-                        rewrite_metric_branch_for_transition(cmd, &original_head, &new_tip, None);
+                    let branch = rewrite_metric_branch_for_transition(
+                        cmd,
+                        &pending.original_head,
+                        &new_tip,
+                        None,
+                    );
                     crate::daemon::rewrite_metrics::spawn_rewrite_commit_metrics(
                         &repo,
                         rewrite_metric_commits_with_branch(metric_commits, branch),
@@ -5465,6 +5585,12 @@ impl ActorDaemonCoordinator {
     fn start_commit_file_timestamp_snapshots_for_command(
         command: &crate::daemon::domain::NormalizedCommand,
     ) -> CommitFileTimestampSnapshotHandles {
+        if config::Config::get().get_feature_flags().lite_mode
+            && command.primary_command.as_deref() == Some("commit")
+            && command.invoked_args.iter().any(|arg| arg == "--amend")
+        {
+            return HashMap::new();
+        }
         let Some(worktree) = command.worktree.clone() else {
             return HashMap::new();
         };
@@ -5578,6 +5704,7 @@ impl ActorDaemonCoordinator {
         let events = &applied.analysis.events;
 
         let primary = cmd.primary_command.as_deref().unwrap_or("unknown");
+        let lite_mode = config::Config::get().get_feature_flags().lite_mode;
 
         #[cfg(feature = "test-support")]
         if let Ok(spec) = std::env::var("GIT_AI_TEST_DELAY_SIDE_EFFECT_MS_FOR_COMMAND") {
@@ -5777,7 +5904,7 @@ impl ActorDaemonCoordinator {
                 if cmd.invoked_args.iter().any(|arg| arg == "--abort") {
                     self.clear_pending_cherry_pick_sources_for_worktree(worktree)?;
                     self.clear_pending_cherry_pick_no_commit_for_worktree(worktree)?;
-                } else if cmd.exit_code != 0 {
+                } else if !lite_mode && cmd.exit_code != 0 {
                     let new_commits = cherry_pick_destination_commits(cmd);
                     let is_continue = cherry_pick_command_has_flag(cmd, "--continue");
                     let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
@@ -5904,7 +6031,16 @@ impl ActorDaemonCoordinator {
                         source_commits,
                         new_commits,
                     } => {
-                        if !new_head.is_empty() {
+                        if lite_mode {
+                            if !original_head.is_empty()
+                                && !new_head.is_empty()
+                                && original_head != new_head
+                            {
+                                let repo = find_repository_in_path(&worktree)?;
+                                repo.storage.rename_working_log(original_head, new_head)?;
+                            }
+                            self.clear_pending_cherry_pick_sources_for_worktree(worktree.as_ref())?;
+                        } else if !new_head.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
                             let mut sources = source_commits.clone();
                             let is_skip = cherry_pick_command_has_flag(cmd, "--skip");
@@ -5957,18 +6093,21 @@ impl ActorDaemonCoordinator {
                         source_commits,
                         head,
                     } => {
-                        let mut sources = source_commits.clone();
-                        if sources.is_empty() {
-                            let repo = find_repository_in_path(&worktree)?;
-                            sources =
-                                resolve_explicit_cherry_pick_sources_for_side_effect(&repo, cmd)?;
-                        }
-                        if !head.is_empty() && !sources.is_empty() {
-                            self.set_pending_cherry_pick_no_commit_for_worktree(
-                                worktree.as_ref(),
-                                sources,
-                                head.clone(),
-                            )?;
+                        if !lite_mode {
+                            let mut sources = source_commits.clone();
+                            if sources.is_empty() {
+                                let repo = find_repository_in_path(&worktree)?;
+                                sources = resolve_explicit_cherry_pick_sources_for_side_effect(
+                                    &repo, cmd,
+                                )?;
+                            }
+                            if !head.is_empty() && !sources.is_empty() {
+                                self.set_pending_cherry_pick_no_commit_for_worktree(
+                                    worktree.as_ref(),
+                                    sources,
+                                    head.clone(),
+                                )?;
+                            }
                         }
                     }
                     crate::daemon::domain::SemanticEvent::MergeSquash { source_head, onto } => {
@@ -6101,6 +6240,18 @@ impl ActorDaemonCoordinator {
                             && cmd.primary_command.as_deref() == Some("revert")
                         {
                             if !handled_revert_commits {
+                                handled_revert_commits = true;
+                                if lite_mode {
+                                    if let Some(base) = base.as_deref()
+                                        && let Some(destination) =
+                                            revert_destination_changes(cmd).last()
+                                        && base != destination.new
+                                    {
+                                        let repo = find_repository_in_path(&worktree)?;
+                                        repo.storage.rename_working_log(base, &destination.new)?;
+                                    }
+                                    continue;
+                                }
                                 // A single `git revert A B` creates one commit per source.
                                 // Reconstruct each destination from the matching HEAD transition
                                 // instead of treating the command as one final CommitCreated event.
@@ -6112,7 +6263,6 @@ impl ActorDaemonCoordinator {
                                     )?;
                                 }
                                 apply_revert_complete_rewrite(&repo, cmd, &source_oids)?;
-                                handled_revert_commits = true;
                             }
                         } else if !new_head.is_empty() {
                             let repo = find_repository_in_path(&worktree)?;
@@ -6157,7 +6307,8 @@ impl ActorDaemonCoordinator {
                                 )
                             })?;
 
-                            if cmd.primary_command.as_deref() == Some("commit")
+                            if !lite_mode
+                                && cmd.primary_command.as_deref() == Some("commit")
                                 && let Some(pending) = self
                                     .take_pending_cherry_pick_no_commit_for_worktree(
                                         worktree.as_ref(),
@@ -6190,6 +6341,10 @@ impl ActorDaemonCoordinator {
                             && !is_zero_oid(new_head)
                         {
                             let repo = find_repository_in_path(&worktree)?;
+                            if lite_mode {
+                                repo.storage.rename_working_log(old_head, new_head)?;
+                                continue;
+                            }
                             let author = repo.effective_author_identity().formatted_or_unknown();
                             let recovery_file_timestamps = Self::take_commit_file_timestamps(
                                 commit_file_timestamp_snapshots,
@@ -6253,7 +6408,7 @@ impl ActorDaemonCoordinator {
                                     // commit): carry the working log to the new base,
                                     // matching the pull fast-forward side effect.
                                     repo.storage.rename_working_log(old_head, new_head)?;
-                                } else {
+                                } else if !lite_mode {
                                     let outcome =
                                         crate::authorship::rewrite::handle_rewrite_event_with_metrics(
                                         &repo,
@@ -6325,6 +6480,11 @@ impl ActorDaemonCoordinator {
                         || is_zero_oid(new)
                         || old == new
                     {
+                        continue;
+                    }
+                    if lite_mode {
+                        // The trace-derived pass above already moved the working log when this
+                        // transition also moved HEAD. Avoid the commit-graph lookup and note write.
                         continue;
                     }
                     let repo = find_repository_in_path(&worktree.to_string_lossy())?;
@@ -6589,7 +6749,8 @@ impl ActorDaemonCoordinator {
             .await;
         self.wait_for_no_unadmitted_checkpoints().await;
         let family = self.backend.resolve_family(Path::new(&repo_working_dir))?;
-        self.wait_for_trace_ingest_processed_through().await;
+        self.wait_for_trace_ingest_processed_through_family(&family.0)
+            .await;
 
         let exec_lock = self.side_effect_exec_lock(&family.0)?;
         loop {
@@ -7312,12 +7473,11 @@ fn windows_control_pipe_worker_loop(
 
 #[cfg(windows)]
 fn handle_windows_control_pipe_connection(
-    mut server: WindowsPipeServer,
+    server: WindowsPipeServer,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
-    server.set_read_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT));
-    let mut reader = BufReader::new(&mut server);
+    let mut reader = BufReader::new(server);
     if let Err(e) = handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
     {
         tracing::error!(
@@ -7330,34 +7490,82 @@ fn handle_windows_control_pipe_connection(
     }
 }
 
+trait ControlConnection: Read + Write {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError>;
+}
+
+#[cfg(windows)]
+impl ControlConnection for WindowsPipeServer {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError> {
+        self.set_read_timeout(timeout);
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+impl ControlConnection for LocalSocketStream {
+    fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError> {
+        self.set_recv_timeout(timeout).map_err(|error| {
+            GitAiError::Generic(format!(
+                "failed setting daemon control receive timeout: {error}"
+            ))
+        })
+    }
+}
+
+fn control_receive_timed_out(error: &GitAiError) -> bool {
+    matches!(
+        error,
+        GitAiError::IoError(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
 #[cfg(not(windows))]
 fn handle_control_connection_actor(
     stream: LocalSocketStream,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), GitAiError> {
-    stream
-        .set_recv_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))
-        .map_err(|error| {
-            GitAiError::Generic(format!(
-                "failed setting daemon control receive timeout: {error}"
-            ))
-        })?;
     let mut reader = BufReader::new(stream);
     handle_control_connection_actor_reader(&mut reader, coordinator, runtime_handle)
 }
 
-fn handle_control_connection_actor_reader<R: Read + Write>(
+fn handle_control_connection_actor_reader<R: ControlConnection>(
     reader: &mut BufReader<R>,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) -> Result<(), GitAiError> {
-    while let Some(line) = read_json_line(reader)? {
+    reader
+        .get_mut()
+        .set_receive_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))?;
+    let mut uses_idle_timeout = false;
+    loop {
+        let line = match read_json_line(reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) if control_receive_timed_out(&error) => break,
+            Err(error) => return Err(error),
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let parsed = serde_json::from_str::<ControlRequest>(trimmed);
+        if !uses_idle_timeout
+            && matches!(
+                &parsed,
+                Ok(request) if !matches!(request, ControlRequest::CheckpointRun { .. })
+            )
+        {
+            reader
+                .get_mut()
+                .set_receive_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT))?;
+            uses_idle_timeout = true;
+        }
         let mut shutdown_after_response = false;
         let response = match parsed {
             Ok(ControlRequest::CheckpointRun { body_bytes }) => {
@@ -7440,6 +7648,11 @@ fn handle_control_connection_actor_reader<R: Read + Write>(
                     return Err(error);
                 }
 
+                if uses_idle_timeout {
+                    reader
+                        .get_mut()
+                        .set_receive_timeout(Some(DAEMON_CONTROL_RECEIVE_TIMEOUT))?;
+                }
                 let body = match read_checkpoint_body(reader, reservation.body_bytes()) {
                     Ok(body) => body,
                     Err(error) => {
@@ -7454,6 +7667,11 @@ fn handle_control_connection_actor_reader<R: Read + Write>(
                         return Err(error);
                     }
                 };
+                if uses_idle_timeout {
+                    reader
+                        .get_mut()
+                        .set_receive_timeout(Some(DAEMON_CONTROL_IDLE_TIMEOUT))?;
+                }
                 let Some(checkpoint_tx) = coordinator.checkpoint_ingress_tx.get().cloned() else {
                     tracing::error!(
                         component = "daemon",
@@ -8096,10 +8314,10 @@ fn daemon_min_uptime_for_self_restart() -> u64 {
         .unwrap_or(DAEMON_MIN_UPTIME_FOR_SELF_RESTART_SECS)
 }
 
-/// Background loop that verifies the daemon's sockets are reachable by
-/// actually connecting to them.  A successful connect proves the socket file
-/// exists, points to this daemon's listener, and that the listener thread is
-/// alive and calling accept().  If either probe fails (deleted file, stale
+/// Background loop that verifies the daemon's sockets are reachable. The
+/// control probe performs a bounded Ping request so it also proves a handler
+/// can receive and respond, while the write-only trace2 socket is verified by
+/// connecting to its listener. If either probe fails (deleted file, stale
 /// socket, hung listener), the daemon spawns a detached restart process and
 /// shuts down.
 ///
@@ -8140,8 +8358,21 @@ fn daemon_socket_health_check_loop(
             return;
         }
 
-        let control_ok =
-            local_socket_connects_with_timeout(&control_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
+        let control_ok = send_control_request_with_timeouts(
+            &control_socket_path,
+            &ControlRequest::Ping,
+            DAEMON_SOCKET_PROBE_TIMEOUT,
+            DAEMON_CONTROL_RESPONSE_TIMEOUT,
+        )
+        .and_then(|response| {
+            if response.ok {
+                Ok(())
+            } else {
+                Err(GitAiError::Generic(response.error.unwrap_or_else(|| {
+                    "daemon Ping returned an error".to_string()
+                })))
+            }
+        });
         let trace_ok =
             local_socket_connects_with_timeout(&trace_socket_path, DAEMON_SOCKET_PROBE_TIMEOUT);
 
@@ -8374,6 +8605,11 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     let coordinator = Arc::new(coordinator_inner);
     coordinator.start_trace_ingest_worker()?;
     coordinator.start_checkpoint_ingress_worker()?;
+    if let Some(limit_mb) = config::Config::get().daemon_memory_limit_mb()
+        && let Some(limit_bytes) = limit_mb.checked_mul(config::MEBIBYTE_BYTES)
+    {
+        memory_watchdog::start(Arc::clone(&coordinator), limit_bytes)?;
+    }
     let rt_handle = tokio::runtime::Handle::current();
     let control_socket_path = config.control_socket_path.clone();
     let trace_socket_path = config.trace_socket_path.clone();
@@ -9851,6 +10087,74 @@ mod tests {
         )
         .await
         .expect("checkpoint fence should pass once the mutating trace root closes");
+    }
+
+    #[tokio::test]
+    async fn family_fence_ignores_open_mutating_roots_of_other_families() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        let temp = tempfile::tempdir().unwrap();
+        let other_repo = temp.path().join("other-repo");
+        std::fs::create_dir_all(other_repo.join(".git")).unwrap();
+        std::fs::write(
+            other_repo.join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+
+        let sid = "20260411T120000.000000-Psid1";
+        coord.trace_root_connection_opened(sid).unwrap();
+        let mut start = make_start_payload(&["git", "commit", "-m", "other repo commit"]);
+        assert!(coord.prepare_trace_payload_for_ingest(&mut start));
+
+        // Before the root is attributed to a repository, it must block every
+        // family (fail closed: it could belong to any of them).
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                coord.wait_for_trace_ingest_processed_through_family("/some/unrelated/family")
+            )
+            .await
+            .is_err(),
+            "an unattributed mutating root must block all family fences"
+        );
+
+        // def_repo attributes the root to other-repo's family; unrelated
+        // families must no longer wait on it.
+        let mut def_repo = serde_json::json!({
+            "event": "def_repo",
+            "sid": sid,
+            "worktree": other_repo.to_string_lossy(),
+        });
+        assert!(coord.prepare_trace_payload_for_ingest(&mut def_repo));
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            coord.wait_for_trace_ingest_processed_through_family("/some/unrelated/family"),
+        )
+        .await
+        .expect("a mutating root attributed to another family must not block this fence");
+
+        // The root's own family still waits until the connection closes.
+        let own_family = coord.backend.resolve_family(&other_repo).unwrap().0;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                coord.wait_for_trace_ingest_processed_through_family(&own_family)
+            )
+            .await
+            .is_err(),
+            "the root's own family fence must still wait for the open root"
+        );
+
+        coord
+            .record_trace_connection_close(&[sid.to_string()])
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            coord.wait_for_trace_ingest_processed_through_family(&own_family),
+        )
+        .await
+        .expect("own family fence should pass once the root closes");
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::authorship::range_authorship::{EMPTY_TREE_HASH, range_authorship, should_ignore_file};
 use git_ai::git::repository::{CommitRange, find_repository_in_path};
@@ -979,6 +980,8 @@ fn test_range_authorship_human_unknown_not_inverted() {
     repo.git_ai(&["checkpoint", "mock_known_human", "test.txt"])
         .unwrap();
     repo.stage_all_and_commit("Initial human commit").unwrap();
+    let mut file = repo.filename("test.txt");
+    file.assert_committed_lines(lines!["Human Line 1".human()]);
     let first_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
@@ -994,6 +997,14 @@ fn test_range_authorship_human_unknown_not_inverted() {
     repo.git(&["add", "test.txt"]).unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "test.txt"]).unwrap();
     repo.stage_all_and_commit("AI adds 5 lines").unwrap();
+    file.assert_committed_lines(lines![
+        "Human Line 1".human(),
+        "AI Line 2".ai(),
+        "AI Line 3".ai(),
+        "AI Line 4".ai(),
+        "AI Line 5".ai(),
+        "AI Line 6".ai(),
+    ]);
 
     // Add more human work
     std::fs::write(
@@ -1004,7 +1015,21 @@ fn test_range_authorship_human_unknown_not_inverted() {
     repo.git(&["add", "test.txt"]).unwrap();
     repo.git_ai(&["checkpoint", "mock_known_human", "test.txt"])
         .unwrap();
-    repo.stage_all_and_commit("Human adds 5 more lines").unwrap();
+    repo.stage_all_and_commit("Human adds 5 more lines")
+        .unwrap();
+    file.assert_committed_lines(lines![
+        "Human Line 1".human(),
+        "AI Line 2".ai(),
+        "AI Line 3".ai(),
+        "AI Line 4".ai(),
+        "AI Line 5".ai(),
+        "AI Line 6".ai(),
+        "Human Line 7".human(),
+        "Human Line 8".human(),
+        "Human Line 9".human(),
+        "Human Line 10".human(),
+        "Human Line 11".human(),
+    ]);
     let second_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
@@ -1034,7 +1059,8 @@ fn test_range_authorship_human_unknown_not_inverted() {
     );
     // The key assertion: verify human lines are NOT in unknown_additions
     assert!(
-        stats.range_stats.unknown_additions == 0 || stats.range_stats.unknown_additions < stats.range_stats.human_additions,
+        stats.range_stats.unknown_additions == 0
+            || stats.range_stats.unknown_additions < stats.range_stats.human_additions,
         "unknown_additions should be much less than human_additions (or 0), not equal or greater"
     );
 
@@ -1059,6 +1085,12 @@ fn test_range_authorship_multiple_human_and_ai_commits() {
     repo.git_ai(&["checkpoint", "mock_known_human", "file.txt"])
         .unwrap();
     repo.stage_all_and_commit("Human commit 1").unwrap();
+    let mut file = repo.filename("file.txt");
+    file.assert_committed_lines(
+        (1..=10)
+            .map(|i| format!("Human line {i}").human())
+            .collect(),
+    );
     let commit1_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
@@ -1071,9 +1103,14 @@ fn test_range_authorship_multiple_human_and_ai_commits() {
     }
     std::fs::write(repo.path().join("file.txt"), &content).unwrap();
     repo.git(&["add", "file.txt"]).unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
     repo.stage_all_and_commit("AI commit 1").unwrap();
+    file.assert_committed_lines(
+        (1..=10)
+            .map(|i| format!("Human line {i}").human())
+            .chain((1..=15).map(|i| format!("AI line {i}").ai()))
+            .collect(),
+    );
 
     // Commit 3: Human work (5 lines)
     for i in 1..=5 {
@@ -1084,6 +1121,13 @@ fn test_range_authorship_multiple_human_and_ai_commits() {
     repo.git_ai(&["checkpoint", "mock_known_human", "file.txt"])
         .unwrap();
     repo.stage_all_and_commit("Human commit 2").unwrap();
+    file.assert_committed_lines(
+        (1..=10)
+            .map(|i| format!("Human line {i}").human())
+            .chain((1..=15).map(|i| format!("AI line {i}").ai()))
+            .chain((1..=5).map(|i| format!("Human line 2-{i}").human()))
+            .collect(),
+    );
 
     // Commit 4: AI work (8 lines)
     for i in 1..=8 {
@@ -1091,9 +1135,16 @@ fn test_range_authorship_multiple_human_and_ai_commits() {
     }
     std::fs::write(repo.path().join("file.txt"), &content).unwrap();
     repo.git(&["add", "file.txt"]).unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
     repo.stage_all_and_commit("AI commit 2").unwrap();
+    file.assert_committed_lines(
+        (1..=10)
+            .map(|i| format!("Human line {i}").human())
+            .chain((1..=15).map(|i| format!("AI line {i}").ai()))
+            .chain((1..=5).map(|i| format!("Human line 2-{i}").human()))
+            .chain((1..=8).map(|i| format!("AI line 2-{i}").ai()))
+            .collect(),
+    );
     let final_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
@@ -1150,19 +1201,16 @@ fn test_range_authorship_verify_per_commit_consistency() {
     repo.git(&["add", "file.txt"]).unwrap();
     repo.git_ai(&["checkpoint", "mock_known_human", "file.txt"])
         .unwrap();
-    repo.stage_all_and_commit("Commit 1: Human")
-        .unwrap();
+    repo.stage_all_and_commit("Commit 1: Human").unwrap();
+    let mut file = repo.filename("file.txt");
+    file.assert_committed_lines((1..=5).map(|i| format!("Human {i}").human()).collect());
     let commit1_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
         .trim()
         .to_string();
-    let _commit1_stats = git_ai::authorship::stats::stats_for_commit_stats(
-        &gitai_repo,
-        &commit1_sha,
-        &[],
-    )
-    .unwrap();
+    let _commit1_stats =
+        git_ai::authorship::stats::stats_for_commit_stats(&gitai_repo, &commit1_sha, &[]).unwrap();
 
     // Commit 2: All AI
     for i in 1..=8 {
@@ -1170,45 +1218,51 @@ fn test_range_authorship_verify_per_commit_consistency() {
     }
     std::fs::write(repo.path().join("file.txt"), &content).unwrap();
     repo.git(&["add", "file.txt"]).unwrap();
-    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"])
-        .unwrap();
+    repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
     repo.stage_all_and_commit("Commit 2: AI").unwrap();
+    file.assert_committed_lines(
+        (1..=5)
+            .map(|i| format!("Human {i}").human())
+            .chain((1..=8).map(|i| format!("AI {i}").ai()))
+            .collect(),
+    );
     let commit2_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
         .trim()
         .to_string();
-    let _commit2_stats = git_ai::authorship::stats::stats_for_commit_stats(
-        &gitai_repo,
-        &commit2_sha,
-        &[],
-    )
-    .unwrap();
+    let _commit2_stats =
+        git_ai::authorship::stats::stats_for_commit_stats(&gitai_repo, &commit2_sha, &[]).unwrap();
 
     // Commit 3: Mixed
     for i in 1..=3 {
         content.push_str(&format!("Human2 {}\n", i));
     }
+    std::fs::write(repo.path().join("file.txt"), &content).unwrap();
+    repo.git_ai(&["checkpoint", "mock_known_human", "file.txt"])
+        .unwrap();
     for i in 1..=4 {
         content.push_str(&format!("AI2 {}\n", i));
     }
     std::fs::write(repo.path().join("file.txt"), &content).unwrap();
     repo.git(&["add", "file.txt"]).unwrap();
-    repo.git_ai(&["checkpoint", "mock_known_human", "file.txt"])
-        .unwrap();
     repo.git_ai(&["checkpoint", "mock_ai", "file.txt"]).unwrap();
     repo.stage_all_and_commit("Commit 3: Mixed").unwrap();
+    file.assert_committed_lines(
+        (1..=5)
+            .map(|i| format!("Human {i}").human())
+            .chain((1..=8).map(|i| format!("AI {i}").ai()))
+            .chain((1..=3).map(|i| format!("Human2 {i}").human()))
+            .chain((1..=4).map(|i| format!("AI2 {i}").ai()))
+            .collect(),
+    );
     let commit3_sha = repo
         .git_og(&["rev-parse", "HEAD"])
         .unwrap()
         .trim()
         .to_string();
-    let _commit3_stats = git_ai::authorship::stats::stats_for_commit_stats(
-        &gitai_repo,
-        &commit3_sha,
-        &[],
-    )
-    .unwrap();
+    let _commit3_stats =
+        git_ai::authorship::stats::stats_for_commit_stats(&gitai_repo, &commit3_sha, &[]).unwrap();
 
     // Get range stats
     let commit_range = CommitRange::new_infer_refname(
