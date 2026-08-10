@@ -6,7 +6,10 @@ use serde::Serialize;
 
 use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
 use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
-use crate::authorship::stats::{CommitStats, accepted_lines_from_attestations, stats_for_commit_stats, stats_from_authorship_log};
+use crate::authorship::stats::{
+    CommitStats, accepted_lines_from_attestations, stats_for_commit_stats,
+    stats_from_authorship_log,
+};
 use crate::error::GitAiError;
 use crate::git::notes_api::{CommitAuthorship, filter_commits_with_notes};
 use crate::git::repository::{CommitRange, InternalGitProfile, Repository, exec_git_with_profile};
