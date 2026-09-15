@@ -1,0 +1,53 @@
+src/commands/config.rs
+  s_8850df75c1d9a8::t_5d4dda6c7d1b10 896-906
+  s_8850df75c1d9a8::t_ec7869adb927db 1284-1290
+  s_8850df75c1d9a8::t_2427c23b0edca4 403-405
+  s_8850df75c1d9a8::t_adca3f96912ca1 552-554
+  s_8850df75c1d9a8::t_8317d374c9b456 125-127
+  s_8850df75c1d9a8::t_4351023833227f 402
+tests/integration/config_cli_coverage.rs
+  s_8850df75c1d9a8::t_7add3d21b24906 340
+src/authorship/range_authorship.rs
+  s_8850df75c1d9a8::t_22837e00a31317 382-392
+src/commands/blame.rs
+  s_8850df75c1d9a8::t_bc65b8ca143189 26-34
+src/authorship/virtual_attribution.rs
+  s_8850df75c1d9a8::t_22837e00a31317 3427-3438
+tests/integration/stats.rs
+  s_8850df75c1d9a8::t_25d8caaf645f70 1002-1007,1012-1016,1026,1031-1042,1045,1047,1049-1051,1060-1061,1063-1064,1076,1086,1089-1125
+  s_8850df75c1d9a8::t_0a530c3651c93d 1052-1055,1057-1059,1062,1065-1067,1069-1074,1077-1085,1087-1088
+  s_8850df75c1d9a8::t_f43137d7311f08 1148
+  s_8850df75c1d9a8::t_e3a6289a1f8f6a 1008-1011,1017-1022,1027-1030,1043-1044,1046,1048
+  s_8850df75c1d9a8::t_77b1fe5a66f727 1147,1149
+  s_8850df75c1d9a8::t_8317d374c9b456 1023-1025
+  s_8850df75c1d9a8::t_84a0912618e15e 1056,1068,1075
+src/authorship/diff_ai_accepted.rs
+  s_8850df75c1d9a8::t_22837e00a31317 43-55
+src/config.rs
+  s_8850df75c1d9a8::t_c7301caf2697cd 1792-1794
+  s_8850df75c1d9a8::t_f06f12175b9dac 1243-1248
+  s_8850df75c1d9a8::t_c59cd425cd86ba 1283
+  s_8850df75c1d9a8::t_46907735dcc476 196
+  s_8850df75c1d9a8::t_c36f65668b90eb 681-686
+  s_8850df75c1d9a8::t_dd38867ed80660 357-358
+  s_8850df75c1d9a8::t_766f7dcee72a6b 24-27
+  s_8850df75c1d9a8::t_a10acde008f808 286-287
+  s_8850df75c1d9a8::t_40566d3f126db7 1318
+  s_8850df75c1d9a8::t_4bd947046db17d 1842,2089,2239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "0927b29ecdc601d3d73e42b3bb7f193c864c4cdf",
+  "prompts": {},
+  "sessions": {
+    "s_8850df75c1d9a8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d1a461f-037b-4cf3-b4b7-54b7cfef5d71",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": null
+    }
+  }
+}
