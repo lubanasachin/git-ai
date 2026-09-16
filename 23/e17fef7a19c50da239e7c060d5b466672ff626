@@ -1,0 +1,28 @@
+.serena/.gitignore
+  h_9440633a297247 1-2
+.serena/memories/conventions.md
+  h_9440633a297247 1-88
+.serena/memories/core.md
+  h_9440633a297247 1-86
+.serena/memories/memory_maintenance.md
+  h_9440633a297247 1-33
+.serena/memories/suggested_commands.md
+  h_9440633a297247 1-79
+.serena/memories/task_completion.md
+  h_9440633a297247 1-50
+.serena/memories/tech_stack.md
+  h_9440633a297247 1-56
+.serena/project.yml
+  h_9440633a297247 1-169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "23e17fef7a19c50da239e7c060d5b466672ff626",
+  "prompts": {},
+  "humans": {
+    "h_9440633a297247": {
+      "author": "Sachin Lubana <sachin.lubana@deliveryhero.com>"
+    }
+  }
+}
