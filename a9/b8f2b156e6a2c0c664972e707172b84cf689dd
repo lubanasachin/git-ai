@@ -1,0 +1,20 @@
+src/authorship/range_authorship.rs
+  s_143b00b7474f36::t_1cad19b7d43fce 359-360
+  s_143b00b7474f36::t_3c62ea2786cf7d 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a9b8f2b156e6a2c0c664972e707172b84cf689dd",
+  "prompts": {},
+  "sessions": {
+    "s_143b00b7474f36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b2930c-8394-43ec-9e70-1b0cc40262fe",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Sachin Lubana <sachin.lubana@deliveryhero.com>"
+    }
+  }
+}
