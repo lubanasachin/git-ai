@@ -1,0 +1,22 @@
+src/git/refs.rs
+  s_143b00b7474f36::t_38124ea7e4fc83 1099-1102
+  s_143b00b7474f36::t_858177906fbde3 1286-1298
+  s_143b00b7474f36::t_df9a37bb61ebd1 1098
+  s_143b00b7474f36::t_e37bd53e6c3408 1285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "a177a7ae3a580a8b3d863528d12c06d5592c378b",
+  "prompts": {},
+  "sessions": {
+    "s_143b00b7474f36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b2930c-8394-43ec-9e70-1b0cc40262fe",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Sachin Lubana <sachin.lubana@deliveryhero.com>"
+    }
+  }
+}
